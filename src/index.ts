@@ -59,13 +59,15 @@ class TimelyClient {
     baseUrl: string | undefined,
     readonly defaultCompanyRegister: string | undefined
   ) {
-    if (!username || !password) {
-      throw new Error("Timely credentials missing. Set TIMELY_USERNAME and TIMELY_PASSWORD.");
-    }
+    // Do NOT throw on missing creds here — tools/list and listing must work
+    // without credentials. The check is deferred to login() (first API call).
     this.baseUrl = (baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
   }
 
   async login(force = false): Promise<string> {
+    if (!this.username || !this.password) {
+      throw new TimelyError("Timely credentials missing. Set TIMELY_USERNAME and TIMELY_PASSWORD.");
+    }
     if (this.token && !force) return this.token;
     if (this.loginInFlight) return this.loginInFlight;
     this.loginInFlight = (async () => {
@@ -386,16 +388,16 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   }
   if (body === undefined) body = await readBody(req);
 
-  const mcp = createMcpServer();
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-    enableJsonResponse: true,
-  });
-  res.on("close", () => {
-    void transport.close();
-    void mcp.close();
-  });
   try {
+    const mcp = createMcpServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+    res.on("close", () => {
+      void transport.close();
+      void mcp.close();
+    });
     await mcp.connect(transport);
     await transport.handleRequest(req, res, body);
   } catch (err) {
