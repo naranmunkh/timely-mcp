@@ -19,8 +19,9 @@
  *   TIMELY_BASE_URL                    optional API base override
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -336,68 +337,76 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
   }
 }
 
-function startHttpServer(port: number): void {
-  const server = createServer(async (req, res) => {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+/**
+ * Vercel function handler (default export). Vercel detects this module as the
+ * project entrypoint and invokes this per request with Node req/res. Handles
+ * any path: GET /health and other GETs return info (no auth); POST is the
+ * bearer-guarded MCP endpoint over Streamable HTTP.
+ */
+export default async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
-    // Health check (no auth)
-    if (req.method === "GET" && url.pathname === "/health") {
-      sendJson(res, 200, { status: "ok" });
-      return;
-    }
-    // Info page for any other GET (no auth)
-    if (req.method === "GET") {
-      sendJson(res, 200, {
-        name: "timely-mcp",
-        message: "POST to /mcp with Authorization: Bearer <token> to use the MCP endpoint.",
-      });
-      return;
-    }
-    // Everything else must be a POST to the MCP endpoint
-    if (req.method !== "POST") {
-      sendJson(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null });
-      return;
-    }
+  if (req.method === "GET" && url.pathname === "/health") {
+    sendJson(res, 200, { status: "ok" });
+    return;
+  }
+  if (req.method === "GET") {
+    sendJson(res, 200, {
+      name: "timely-mcp",
+      message: "POST to /mcp with Authorization: Bearer <token> to use the MCP endpoint.",
+    });
+    return;
+  }
+  if (req.method !== "POST") {
+    sendJson(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null });
+    return;
+  }
 
-    if (!process.env.TIMELY_MCP_AUTH_TOKEN) {
+  if (!process.env.TIMELY_MCP_AUTH_TOKEN) {
+    sendJson(res, 500, {
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Server misconfigured: TIMELY_MCP_AUTH_TOKEN not set." },
+      id: null,
+    });
+    return;
+  }
+  if (!httpAuthorized(req)) {
+    sendJson(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+    return;
+  }
+
+  // Vercel may pre-parse the JSON body onto req.body; fall back to reading the stream.
+  let body = (req as IncomingMessage & { body?: unknown }).body;
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body);
+    } catch {
+      body = undefined;
+    }
+  }
+  if (body === undefined) body = await readBody(req);
+
+  const mcp = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+  });
+  res.on("close", () => {
+    void transport.close();
+    void mcp.close();
+  });
+  try {
+    await mcp.connect(transport);
+    await transport.handleRequest(req, res, body);
+  } catch (err) {
+    if (!res.headersSent) {
       sendJson(res, 500, {
         jsonrpc: "2.0",
-        error: { code: -32001, message: "Server misconfigured: TIMELY_MCP_AUTH_TOKEN not set." },
+        error: { code: -32603, message: err instanceof Error ? err.message : String(err) },
         id: null,
       });
-      return;
     }
-    if (!httpAuthorized(req)) {
-      sendJson(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
-      return;
-    }
-
-    const body = await readBody(req);
-    const mcp = createMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: true,
-    });
-    res.on("close", () => {
-      void transport.close();
-      void mcp.close();
-    });
-    try {
-      await mcp.connect(transport);
-      await transport.handleRequest(req, res, body);
-    } catch (err) {
-      if (!res.headersSent) {
-        sendJson(res, 500, {
-          jsonrpc: "2.0",
-          error: { code: -32603, message: err instanceof Error ? err.message : String(err) },
-          id: null,
-        });
-      }
-    }
-  });
-  server.listen(port, () => {
-    console.error(`timely-mcp HTTP server listening on :${port}`);
-  });
+  }
 }
 
 // ===========================================================================
@@ -412,13 +421,22 @@ async function startStdio(): Promise<void> {
 }
 
 // ===========================================================================
-// Boot — HTTP when PORT is set (Vercel), otherwise stdio.
+// Boot — stdio only when run directly as a CLI (local / Claude Desktop).
+// When imported by Vercel as a function module, nothing runs at top level;
+// Vercel invokes the default export above per request.
 // ===========================================================================
 
-const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-if (port && Number.isFinite(port)) {
-  startHttpServer(port);
-} else {
+function isRunDirectly(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(entry).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isRunDirectly()) {
   startStdio().catch((err) => {
     console.error("Fatal error starting timely-mcp:", err);
     process.exit(1);
