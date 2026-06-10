@@ -102,14 +102,32 @@ class TimelyClient {
 
     let token = await this.login();
     let res = await doRequest(token);
-    if (res.status === 401 || res.status === 403) {
+    let body = await safeJson(res);
+    // Timely's v3 endpoints return a valid success envelope even with an HTTP
+    // 401 status, so only retry with a fresh token when the body is NOT already
+    // a successful envelope.
+    if ((res.status === 401 || res.status === 403) && !isSuccessEnvelope(body)) {
       token = await this.login(true);
       res = await doRequest(token);
+      body = await safeJson(res);
     }
-    const body = await safeJson(res);
+    // Trust the body envelope over the HTTP status (Timely's codes are unreliable).
+    if (isEnvelope(body)) return normalizeEnvelope<T>(body);
     if (!res.ok) throw new TimelyError(`Timely API error on ${path} (HTTP ${res.status})`, res.status, body);
     return normalizeEnvelope<T>(body);
   }
+}
+
+/** True if the body is a Timely-shaped envelope (has a `success` field). */
+function isEnvelope(body: unknown): boolean {
+  return !!body && typeof body === "object" && "success" in (body as Record<string, unknown>);
+}
+
+/** True if the body is an envelope whose `success` flag is truthy. */
+function isSuccessEnvelope(body: unknown): boolean {
+  if (!isEnvelope(body)) return false;
+  const s = (body as Record<string, unknown>).success;
+  return s === "1" || s === 1 || s === true;
 }
 
 async function safeJson(res: Response): Promise<unknown> {
@@ -238,10 +256,10 @@ function createMcpServer(): McpServer {
       guarded(() => {
         const payload: Record<string, unknown> = {
           company_register: resolveRegister(company_register),
-          div_id: div_id ?? "0",
           dateFrom,
           dateTo,
         };
+        if (div_id !== undefined) payload.div_id = div_id;
         if (page !== undefined) payload.page = page;
         if (limit !== undefined) payload.limit = limit;
         return client.post("/v3/overview-attd", payload);
