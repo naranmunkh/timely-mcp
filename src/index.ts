@@ -143,6 +143,7 @@ function extractToken(body: unknown): string | null {
   const obj = body as Record<string, any>;
   const candidates = [
     obj.token, obj.access_token, obj.accessToken, obj.jwt,
+    typeof obj.data === "string" ? obj.data : undefined,
     obj.data?.token, obj.data?.access_token, obj.data?.accessToken, obj.data?.jwt,
   ];
   for (const c of candidates) if (typeof c === "string" && c.length > 0) return c;
