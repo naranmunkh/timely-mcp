@@ -1,8 +1,4 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "builds": [{ "src": "api/mcp.ts", "use": "@vercel/node" }],
-  "routes": [
-    { "src": "/mcp", "dest": "/api/mcp" },
-    { "handle": "filesystem" }
-  ]
+  "builds": [{ "src": "api/mcp.ts", "use": "@vercel/node" }]
 }
