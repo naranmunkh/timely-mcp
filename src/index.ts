@@ -308,17 +308,36 @@ function createMcpServer(): McpServer {
 // HTTP mode (Vercel) — bearer-guarded Streamable HTTP
 // ===========================================================================
 
-function httpAuthorized(req: IncomingMessage): boolean {
+function tokenMatches(provided: string | null | undefined): boolean {
   const expected = process.env.TIMELY_MCP_AUTH_TOKEN;
-  if (!expected) return false; // fail closed
+  if (!expected || !provided) return false; // fail closed
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+/** Token from the Authorization: Bearer header, if present. */
+function bearerToken(req: IncomingMessage): string | null {
   const raw = req.headers["authorization"] ?? "";
   const header = Array.isArray(raw) ? raw[0] : raw;
   const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (!match) return false;
-  const provided = Buffer.from(match[1]);
-  const secret = Buffer.from(expected);
-  if (provided.length !== secret.length) return false;
-  return timingSafeEqual(provided, secret);
+  return match ? match[1] : null;
+}
+
+/**
+ * Token from the URL path, e.g. /mcp/<token>. This lets clients that don't
+ * support custom auth headers (some MCP connector UIs that otherwise force an
+ * OAuth flow on a 401) authenticate by embedding the secret in the URL.
+ */
+function pathToken(url: URL): string | null {
+  const segments = url.pathname.split("/").filter(Boolean);
+  if (segments.length >= 2 && segments[0] === "mcp") return segments[1];
+  return null;
+}
+
+function httpAuthorized(req: IncomingMessage, url: URL): boolean {
+  return tokenMatches(bearerToken(req)) || tokenMatches(pathToken(url));
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -353,10 +372,9 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     return;
   }
   if (req.method === "GET") {
-    sendJson(res, 200, {
-      name: "timely-mcp",
-      message: "POST to /mcp with Authorization: Bearer <token> to use the MCP endpoint.",
-    });
+    // 404 (not a 200 info page) so clients don't mistake any path — including
+    // /.well-known/* — for OAuth metadata and start an OAuth flow.
+    sendJson(res, 404, { error: "Not found. POST to /mcp (or /mcp/<token>) for the MCP endpoint." });
     return;
   }
   if (req.method !== "POST") {
@@ -372,7 +390,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     });
     return;
   }
-  if (!httpAuthorized(req)) {
+  if (!httpAuthorized(req, url)) {
     sendJson(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
     return;
   }
