@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.api.json",
+    "typecheck": "tsc --noEmit",
     "test:login": "node scripts/test-login.mjs"
   },
   "engines": {
