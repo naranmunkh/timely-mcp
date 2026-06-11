@@ -20,7 +20,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, createHmac, createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -377,6 +377,114 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
   }
 }
 
+/** Read an application/x-www-form-urlencoded (or pre-parsed) body as a map. */
+async function readForm(req: IncomingMessage): Promise<Record<string, string>> {
+  const pre = (req as IncomingMessage & { body?: unknown }).body;
+  if (pre && typeof pre === "object" && !Buffer.isBuffer(pre)) {
+    return pre as Record<string, string>;
+  }
+  let raw = typeof pre === "string" ? pre : "";
+  if (!raw) {
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    raw = Buffer.concat(chunks).toString("utf8");
+  }
+  const out: Record<string, string> = {};
+  for (const [k, v] of new URLSearchParams(raw)) out[k] = v;
+  return out;
+}
+
+// ===========================================================================
+// OAuth 2.1 (PKCE) — lets MCP clients prompt the user for the secret at
+// connect time instead of embedding a token in the URL. Stateless: auth codes
+// and access tokens are HMAC-signed blobs (no datastore needed). The HMAC key
+// and the password the user types are both TIMELY_MCP_AUTH_TOKEN.
+// ===========================================================================
+
+function hmac(data: string): string {
+  return createHmac("sha256", process.env.TIMELY_MCP_AUTH_TOKEN ?? "").update(data).digest("base64url");
+}
+
+function signPayload(obj: unknown): string {
+  const p = Buffer.from(JSON.stringify(obj)).toString("base64url");
+  return `${p}.${hmac(p)}`;
+}
+
+function verifySigned(token: string): Record<string, any> | null {
+  const dot = token.lastIndexOf(".");
+  if (dot < 0) return null;
+  const p = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  const expected = hmac(p);
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+  try {
+    const obj = JSON.parse(Buffer.from(p, "base64url").toString("utf8"));
+    if (typeof obj.exp === "number" && Date.now() > obj.exp) return null;
+    return obj;
+  } catch {
+    return null;
+  }
+}
+
+function mintAuthCode(redirectUri: string, codeChallenge: string): string {
+  return signPayload({ t: "code", ru: redirectUri, cc: codeChallenge, exp: Date.now() + 5 * 60 * 1000 });
+}
+
+function mintAccessToken(): string {
+  return signPayload({ t: "at", sub: "timely", exp: Date.now() + 30 * 24 * 60 * 60 * 1000 });
+}
+
+function isValidAccessToken(token: string | null | undefined): boolean {
+  if (!token) return false;
+  const obj = verifySigned(token);
+  return !!obj && obj.t === "at";
+}
+
+function pkceOk(verifier: string, challenge: string): boolean {
+  const h = createHash("sha256").update(verifier).digest("base64url");
+  const a = Buffer.from(h);
+  const b = Buffer.from(challenge);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function baseUrl(req: IncomingMessage): string {
+  const proto = (req.headers["x-forwarded-proto"] as string) || "https";
+  const host = req.headers.host ?? "localhost";
+  return `${proto}://${host}`;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string)
+  );
+}
+
+function authorizePage(params: URLSearchParams, error?: string): string {
+  const hidden = ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "scope", "response_type"]
+    .map((k) => `<input type="hidden" name="${k}" value="${escapeHtml(params.get(k) ?? "")}">`)
+    .join("\n");
+  return `<!doctype html><html lang="mn"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Timely MCP — Нэвтрэх</title>
+<style>body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;max-width:380px;margin:5rem auto;padding:0 1.25rem;color:#1a1a1a}
+h1{font-size:1.25rem}label{display:block;margin:1rem 0 .35rem;font-size:.9rem}
+input[type=password]{width:100%;padding:.6rem;border:1px solid #ccc;border-radius:8px;font-size:1rem;box-sizing:border-box}
+button{margin-top:1rem;width:100%;padding:.65rem;border:0;border-radius:8px;background:#1a1a1a;color:#fff;font-size:1rem;cursor:pointer}
+.err{color:#b00020;font-size:.9rem;margin-top:.75rem}.muted{color:#666;font-size:.85rem;margin-top:1rem}</style></head>
+<body><h1>Timely MCP холболт</h1><p class="muted">UBCab Holding-ийн Timely MCP сервер рүү холбогдохын тулд хандах түлхүүрээ оруулна уу.</p>
+<form method="POST" action="/authorize">${hidden}
+<label for="pw">Хандах түлхүүр (access token)</label>
+<input id="pw" type="password" name="password" autocomplete="off" autofocus required>
+${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
+<button type="submit">Зөвшөөрөх</button></form></body></html>`;
+}
+
+function sendHtml(res: ServerResponse, status: number, html: string): void {
+  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(html);
+}
+
 /**
  * Vercel function handler (default export). Vercel detects this module as the
  * project entrypoint and invokes this per request with Node req/res. Handles
@@ -385,22 +493,130 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
  */
 export default async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const path = url.pathname;
+  const method = req.method ?? "GET";
 
-  if (req.method === "GET" && url.pathname === "/health") {
+  if (method === "GET" && path === "/health") {
     sendJson(res, 200, { status: "ok" });
     return;
   }
-  if (req.method === "GET") {
-    // 404 (not a 200 info page) so clients don't mistake any path — including
-    // /.well-known/* — for OAuth metadata and start an OAuth flow.
-    sendJson(res, 404, { error: "Not found. POST to /mcp (or /mcp/<token>) for the MCP endpoint." });
+
+  // ---- OAuth discovery metadata ----
+  if (method === "GET" && path === "/.well-known/oauth-protected-resource") {
+    const base = baseUrl(req);
+    sendJson(res, 200, { resource: `${base}/mcp`, authorization_servers: [base] });
     return;
   }
-  if (req.method !== "POST") {
+  if (
+    method === "GET" &&
+    (path === "/.well-known/oauth-authorization-server" || path === "/.well-known/openid-configuration")
+  ) {
+    const base = baseUrl(req);
+    sendJson(res, 200, {
+      issuer: base,
+      authorization_endpoint: `${base}/authorize`,
+      token_endpoint: `${base}/token`,
+      registration_endpoint: `${base}/register`,
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code"],
+      code_challenge_methods_supported: ["S256"],
+      token_endpoint_auth_methods_supported: ["none"],
+      scopes_supported: ["mcp"],
+    });
+    return;
+  }
+
+  // ---- OAuth dynamic client registration ----
+  if (method === "POST" && path === "/register") {
+    let reg = (req as IncomingMessage & { body?: unknown }).body as Record<string, unknown> | string | undefined;
+    if (reg === undefined || typeof reg === "string") reg = (await readBody(req)) as Record<string, unknown>;
+    const redirectUris = Array.isArray((reg as any)?.redirect_uris) ? (reg as any).redirect_uris : [];
+    sendJson(res, 201, {
+      client_id: "timely-mcp",
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code"],
+      response_types: ["code"],
+      redirect_uris: redirectUris,
+    });
+    return;
+  }
+
+  // ---- OAuth authorize (login form the user sees at connect time) ----
+  if (path === "/authorize") {
+    if (!process.env.TIMELY_MCP_AUTH_TOKEN) {
+      sendJson(res, 500, { error: "server_error", error_description: "TIMELY_MCP_AUTH_TOKEN not set" });
+      return;
+    }
+    if (method === "GET") {
+      sendHtml(res, 200, authorizePage(url.searchParams));
+      return;
+    }
+    if (method === "POST") {
+      const form = await readForm(req);
+      const params = new URLSearchParams();
+      for (const k of ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "scope", "response_type"]) {
+        if (form[k] !== undefined) params.set(k, form[k]);
+      }
+      const redirectUri = form.redirect_uri ?? "";
+      const codeChallenge = form.code_challenge ?? "";
+      if (!redirectUri || !codeChallenge || form.code_challenge_method !== "S256") {
+        sendHtml(res, 400, authorizePage(params, "Буруу хүсэлт (PKCE S256 шаардлагатай)."));
+        return;
+      }
+      if (!tokenMatches(form.password)) {
+        sendHtml(res, 401, authorizePage(params, "Хандах түлхүүр буруу байна."));
+        return;
+      }
+      const code = mintAuthCode(redirectUri, codeChallenge);
+      const sep = redirectUri.includes("?") ? "&" : "?";
+      let location = `${redirectUri}${sep}code=${encodeURIComponent(code)}`;
+      if (form.state) location += `&state=${encodeURIComponent(form.state)}`;
+      res.writeHead(302, { Location: location });
+      res.end();
+      return;
+    }
+  }
+
+  // ---- OAuth token exchange ----
+  if (method === "POST" && path === "/token") {
+    const form = await readForm(req);
+    if (form.grant_type !== "authorization_code") {
+      sendJson(res, 400, { error: "unsupported_grant_type" });
+      return;
+    }
+    const decoded = form.code ? verifySigned(form.code) : null;
+    if (!decoded || decoded.t !== "code") {
+      sendJson(res, 400, { error: "invalid_grant" });
+      return;
+    }
+    if (form.redirect_uri && form.redirect_uri !== decoded.ru) {
+      sendJson(res, 400, { error: "invalid_grant", error_description: "redirect_uri mismatch" });
+      return;
+    }
+    if (!form.code_verifier || !pkceOk(form.code_verifier, decoded.cc)) {
+      sendJson(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" });
+      return;
+    }
+    sendJson(res, 200, {
+      access_token: mintAccessToken(),
+      token_type: "Bearer",
+      expires_in: 30 * 24 * 60 * 60,
+      scope: "mcp",
+    });
+    return;
+  }
+
+  // ---- Non-MCP GETs → 404 ----
+  if (method === "GET") {
+    sendJson(res, 404, { error: "Not found. POST to /mcp for the MCP endpoint." });
+    return;
+  }
+  if (method !== "POST") {
     sendJson(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null });
     return;
   }
 
+  // ---- MCP endpoint (POST /mcp or /mcp/<token>) ----
   if (!process.env.TIMELY_MCP_AUTH_TOKEN) {
     sendJson(res, 500, {
       jsonrpc: "2.0",
@@ -409,8 +625,15 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     });
     return;
   }
-  if (!httpAuthorized(req, url)) {
-    sendJson(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+  const bearer = bearerToken(req);
+  const authed = isValidAccessToken(bearer) || tokenMatches(bearer) || tokenMatches(pathToken(url));
+  if (!authed) {
+    // 401 with resource-metadata pointer triggers the client's OAuth flow.
+    res.writeHead(401, {
+      "Content-Type": "application/json",
+      "WWW-Authenticate": `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`,
+    });
+    res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null }));
     return;
   }
 
