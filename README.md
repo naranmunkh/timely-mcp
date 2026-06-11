@@ -65,6 +65,18 @@ npm run build
 
 ## Connect to the remote endpoint
 
+Three ways to authenticate (the endpoint accepts any of them):
+
+**1. OAuth (recommended — nothing secret in the URL).** Add a custom connector
+with just the URL `https://timely-mcp.vercel.app/mcp`. The client discovers the
+OAuth metadata, opens a login page, and prompts for the access token
+(`TIMELY_MCP_AUTH_TOKEN`). Implemented as a stateless OAuth 2.1 + PKCE server:
+`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`,
+`/register`, `/authorize`, `/token`. Auth codes and access tokens are HMAC-signed
+blobs (no datastore).
+
+**2. Header (Claude Desktop JSON config).**
+
 ```json
 {
   "mcpServers": {
@@ -76,6 +88,9 @@ npm run build
   }
 }
 ```
+
+**3. Token in URL path** (for clients that can't send a header):
+`https://timely-mcp.vercel.app/mcp/<TIMELY_MCP_AUTH_TOKEN>`
 
 Smoke test:
 
